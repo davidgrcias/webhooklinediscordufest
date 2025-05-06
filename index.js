@@ -20,13 +20,12 @@ const DISCORD_WEBHOOK_URL =
   "https://discord.com/api/webhooks/1368830015881347083/RkuAxqV4A2ABNtv0HI2CW4FN3Y7n5hL6XPutmp8bkKaI7kWFO_RFEWlICFyygjpcbJ4C";
 // ─────────────────────────────────────────────────
 
-const processedMessageIds = new Set();
+const app = express();
 const lineConfig = {
   channelSecret: LINE_CHANNEL_SECRET,
   channelAccessToken: LINE_CHANNEL_TOKEN,
 };
 const lineClient = new line.Client(lineConfig);
-const app = express();
 
 app.use(
   bodyParser.json({
@@ -37,7 +36,10 @@ app.use(
 );
 app.use(line.middleware(lineConfig));
 
+const processedMessageIds = new Set();
 let pendingMedia = [];
+let mediaTimer = null;
+let mediaTimeoutMs = 30000;
 
 app.post("/webhook", async (req, res) => {
   const events = req.body.events || [];
@@ -87,6 +89,7 @@ async function handleLineEvent(event) {
     const stream = await lineClient.getMessageContent(id);
     for await (const c of stream) chunks.push(c);
     const buffer = Buffer.concat(chunks);
+
     let filename, contentType;
     if (event.message.type === "file") {
       filename = event.message.fileName;
@@ -100,14 +103,26 @@ async function handleLineEvent(event) {
       filename = `${id}.jpg`;
       contentType = "image/jpeg";
     }
+
     pendingMedia.push({ buffer, filename, contentType });
     console.log(`📅 Queued media ${filename}`);
+
+    // Reset timeout to clear media if no follow-up message
+    if (mediaTimer) clearTimeout(mediaTimer);
+    mediaTimer = setTimeout(() => {
+      if (pendingMedia.length) {
+        console.log(
+          "🗑 Auto-clearing media after timeout (no structured message)"
+        );
+        pendingMedia = [];
+      }
+    }, mediaTimeoutMs);
+
     return;
   }
 
   if (event.type === "message" && event.message.type === "text") {
     const text = event.message.text;
-
     const isTriggerFormat = text.includes("FORMAT SISTEM");
 
     const tagsBlock = text.match(/Tags\s*:\s*\[([\s\S]*?)\]/i)?.[1] || null;
@@ -123,12 +138,15 @@ async function handleLineEvent(event) {
       tagsBlock && hashtagsBlock && linksBlock && captionBlock;
 
     if (isStructured && isTriggerFormat) {
+      if (mediaTimer) clearTimeout(mediaTimer);
+
       const topMessage = text.split("FORMAT SISTEM")[0].trim();
-      if (topMessage)
+      if (topMessage) {
         await sendDiscord({
           content: `**INFO:**\n${topMessage}`,
           allowed_mentions: { parse: ["everyone"] },
         });
+      }
 
       for (const m of pendingMedia) {
         const form = new FormData();
@@ -152,47 +170,52 @@ async function handleLineEvent(event) {
         .split(/\r?\n/)
         .map((l) => l.replace(/^-+\s*/, "").trim())
         .filter(Boolean);
-      for (const t of tags)
+      for (const t of tags) {
         await sendDiscord({
           content: t,
           allowed_mentions: { parse: ["everyone"] },
         });
+      }
 
       const hs = hashtagsBlock
         .split(/\r?\n/)
         .map((l) => l.trim())
         .filter(Boolean)
         .join("\n");
-      if (hs)
+      if (hs) {
         await sendDiscord({
           content: hs,
           allowed_mentions: { parse: ["everyone"] },
         });
+      }
 
       const links = linksBlock
         .split(/\r?\n/)
         .map((l) => l.trim())
         .filter(Boolean);
-      for (const u of links)
+      for (const u of links) {
         await sendDiscord({
           content: u,
           allowed_mentions: { parse: ["everyone"] },
         });
+      }
 
       const caps = captionBlock
         .split(/\r?\n/)
         .map((l) => l.trim())
         .filter(Boolean)
         .join("\n");
-      if (caps)
+      if (caps) {
         await sendDiscord({
           content: caps,
           allowed_mentions: { parse: ["everyone"] },
         });
+      }
     } else {
       if (pendingMedia.length) {
         console.log("🗑 Clearing queued media (no structured reply)");
         pendingMedia = [];
+        if (mediaTimer) clearTimeout(mediaTimer);
       }
     }
   }
