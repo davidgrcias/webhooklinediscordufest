@@ -37,7 +37,7 @@ app.use(
 );
 app.use(line.middleware(lineConfig));
 
-// Pending media queue: store media until structured reply arrives
+// Pending media queue
 let pendingMedia = [];
 
 // Webhook endpoint
@@ -56,11 +56,11 @@ app.post("/webhook", async (req, res) => {
 });
 
 async function handleLineEvent(event) {
-  // Only group messages
+  // Only target group
   if (event.source.type !== "group" || event.source.groupId !== LINE_GROUP_ID)
     return;
 
-  // Helper to send to Discord
+  // Discord send helper
   const sendDiscord = async (
     data,
     headers = { "Content-Type": "application/json" }
@@ -73,7 +73,7 @@ async function handleLineEvent(event) {
     }
   };
 
-  // 1) MEDIA: queue it, but don't send yet
+  // 1) Queue media messages
   if (
     event.type === "message" &&
     ["image", "video", "file"].includes(event.message.type)
@@ -83,8 +83,6 @@ async function handleLineEvent(event) {
     const stream = await lineClient.getMessageContent(id);
     for await (const c of stream) chunks.push(c);
     const buffer = Buffer.concat(chunks);
-
-    // determine filename & contentType
     let filename, contentType;
     if (event.message.type === "file") {
       filename = event.message.fileName;
@@ -98,14 +96,12 @@ async function handleLineEvent(event) {
       filename = `${id}.jpg`;
       contentType = "image/jpeg";
     }
-
-    // store in queue
     pendingMedia.push({ buffer, filename, contentType });
     console.log(`📥 Queued media ${filename}`);
     return;
   }
 
-  // 2) TEXT: check if structured (tags, hashtags, link, caption)
+  // 2) Handle text messages
   if (event.type === "message" && event.message.type === "text") {
     const text = event.message.text;
     const tagsBlock = text.match(/Tags\s*:\s*\[([\s\S]*?)\]/i)?.[1] || null;
@@ -116,12 +112,11 @@ async function handleLineEvent(event) {
       text.match(/Caption\s*:\s*\[([\s\S]*?)\]/i)?.[1] ||
       text.match(/Caption\s*:\s*(?:\r?\n)?([\s\S]*)$/i)?.[1] ||
       null;
-
     const isStructured =
       tagsBlock && hashtagsBlock && linksBlock && captionBlock;
 
     if (isStructured) {
-      // flush pending media first
+      // A) Flush pending media
       for (const m of pendingMedia) {
         const form = new FormData();
         form.append("file", m.buffer, {
@@ -140,19 +135,29 @@ async function handleLineEvent(event) {
       }
       pendingMedia = [];
 
-      // parse & send structured fields
-      // Tags
+      // B) Freeform block before structured section
+      const freeMatch = text.match(/^([\s\S]*?)(?=\s*1\.\s*Tags\s*:)/i);
+      const freeText = freeMatch ? freeMatch[1].trim() : null;
+      if (freeText) {
+        await sendDiscord({
+          content: freeText,
+          allowed_mentions: { parse: ["everyone"] },
+        });
+      }
+
+      // C) Send structured fields
+      // 1) Tags
       const tags = tagsBlock
         .split(/\r?\n/)
         .map((l) => l.replace(/^-+\s*/, "").trim())
         .filter(Boolean);
-      for (const t of tags)
+      for (const t of tags) {
         await sendDiscord({
           content: t,
           allowed_mentions: { parse: ["everyone"] },
         });
-
-      // Hashtags (newline)
+      }
+      // 2) Hashtags
       const hs = hashtagsBlock
         .split(/\r?\n/)
         .map((l) => l.trim())
@@ -163,19 +168,18 @@ async function handleLineEvent(event) {
           content: hs,
           allowed_mentions: { parse: ["everyone"] },
         });
-
-      // Links
+      // 3) Links
       const links = linksBlock
         .split(/\r?\n/)
         .map((l) => l.trim())
         .filter(Boolean);
-      for (const u of links)
+      for (const u of links) {
         await sendDiscord({
           content: u,
           allowed_mentions: { parse: ["everyone"] },
         });
-
-      // Caption
+      }
+      // 4) Caption
       const caps = captionBlock
         .split(/\r?\n/)
         .map((l) => l.trim())
@@ -187,7 +191,7 @@ async function handleLineEvent(event) {
           allowed_mentions: { parse: ["everyone"] },
         });
     } else {
-      // unstructured text: clear any queued media (no reply)
+      // Not structured: clear pending media queue
       if (pendingMedia.length) {
         console.log("🗑 Clearing queued media (no structured reply)");
         pendingMedia = [];
@@ -196,6 +200,6 @@ async function handleLineEvent(event) {
   }
 }
 
-// start server
+// Start server
 const PORT = process.env.PORT || 3000;
 app.listen(PORT, () => console.log(`🚀 Listening on port ${PORT}`));
