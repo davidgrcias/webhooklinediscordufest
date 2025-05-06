@@ -20,9 +20,6 @@ const DISCORD_WEBHOOK_URL =
   "https://discord.com/api/webhooks/1368830015881347083/RkuAxqV4A2ABNtv0HI2CW4FN3Y7n5hL6XPutmp8bkKaI7kWFO_RFEWlICFyygjpcbJ4C";
 // ───────────────────────────────────────────────────────────────────
 
-// Deduplication set
-const processedMessageIds = new Set();
-
 const lineConfig = {
   channelSecret: LINE_CHANNEL_SECRET,
   channelAccessToken: LINE_CHANNEL_TOKEN,
@@ -30,7 +27,7 @@ const lineConfig = {
 const lineClient = new line.Client(lineConfig);
 const app = express();
 
-// 1) parse JSON with raw body
+// Parse JSON & preserve raw body for signature
 app.use(
   bodyParser.json({
     verify: (req, res, buf) => {
@@ -38,40 +35,32 @@ app.use(
     },
   })
 );
-// 2) LINE signature validation
 app.use(line.middleware(lineConfig));
 
-// webhook endpoint
+// Pending media queue: store media until structured reply arrives
+let pendingMedia = [];
+
+// Webhook endpoint
 app.post("/webhook", async (req, res) => {
   const events = req.body.events || [];
   console.log(`📬 Received ${events.length} events`);
   try {
-    for (const event of events) {
-      await handleLineEvent(event);
+    for (const ev of events) {
+      await handleLineEvent(ev);
     }
-    res.sendStatus(200);
+    return res.sendStatus(200);
   } catch (err) {
     console.error("❌ Processing error:", err);
-    res.sendStatus(500);
+    return res.sendStatus(500);
   }
 });
 
 async function handleLineEvent(event) {
-  // Deduplication
-  const msgId = event.message?.id;
-  if (msgId) {
-    if (processedMessageIds.has(msgId)) {
-      console.log(`🔁 Duplicate event ${msgId}, skipping`);
-      return;
-    }
-    processedMessageIds.add(msgId);
-  }
-
-  // Only group
+  // Only group messages
   if (event.source.type !== "group" || event.source.groupId !== LINE_GROUP_ID)
     return;
 
-  // send helper
+  // Helper to send to Discord
   const sendDiscord = async (
     data,
     headers = { "Content-Type": "application/json" }
@@ -79,22 +68,23 @@ async function handleLineEvent(event) {
     try {
       const resp = await axios.post(DISCORD_WEBHOOK_URL, data, { headers });
       console.log("✅ Discord responded:", resp.status);
-    } catch (err) {
-      console.error("❌ Discord error:", err.response?.data || err.message);
+    } catch (e) {
+      console.error("❌ Discord error:", e.response?.data || e.message);
     }
   };
 
-  // 1) MEDIA first
+  // 1) MEDIA: queue it, but don't send yet
   if (
     event.type === "message" &&
     ["image", "video", "file"].includes(event.message.type)
   ) {
     const id = event.message.id;
-    const stream = await lineClient.getMessageContent(id);
     const chunks = [];
+    const stream = await lineClient.getMessageContent(id);
     for await (const c of stream) chunks.push(c);
     const buffer = Buffer.concat(chunks);
-    const form = new FormData();
+
+    // determine filename & contentType
     let filename, contentType;
     if (event.message.type === "file") {
       filename = event.message.fileName;
@@ -108,90 +98,104 @@ async function handleLineEvent(event) {
       filename = `${id}.jpg`;
       contentType = "image/jpeg";
     }
-    form.append("file", buffer, { filename, contentType });
-    form.append(
-      "payload_json",
-      JSON.stringify({
-        content: "@everyone",
-        allowed_mentions: { parse: ["everyone"] },
-      })
-    );
-    await sendDiscord(form, form.getHeaders());
+
+    // store in queue
+    pendingMedia.push({ buffer, filename, contentType });
+    console.log(`📥 Queued media ${filename}`);
     return;
   }
 
-  // 2) TEXT and structured
+  // 2) TEXT: check if structured (tags, hashtags, link, caption)
   if (event.type === "message" && event.message.type === "text") {
     const text = event.message.text;
+    const tagsBlock = text.match(/Tags\s*:\s*\[([\s\S]*?)\]/i)?.[1] || null;
+    const hashtagsBlock =
+      text.match(/Hastags\s*:\s*\[([\s\S]*?)\]/i)?.[1] || null;
+    const linksBlock = text.match(/Link\s*:\s*\[([\s\S]*?)\]/i)?.[1] || null;
+    const captionBlock =
+      text.match(/Caption\s*:\s*\[([\s\S]*?)\]/i)?.[1] ||
+      text.match(/Caption\s*:\s*(?:\r?\n)?([\s\S]*)$/i)?.[1] ||
+      null;
 
-    // a) Freeform content before structured block
-    const freeMatch = text.match(/^([\s\S]*?)(?=\s*1\.\s*Tags\s*:)/i);
-    if (freeMatch) {
-      const freeform = freeMatch[1].trim();
-      if (freeform) {
+    const isStructured =
+      tagsBlock && hashtagsBlock && linksBlock && captionBlock;
+
+    if (isStructured) {
+      // flush pending media first
+      for (const m of pendingMedia) {
+        const form = new FormData();
+        form.append("file", m.buffer, {
+          filename: m.filename,
+          contentType: m.contentType,
+        });
+        form.append(
+          "payload_json",
+          JSON.stringify({
+            content: "@everyone",
+            allowed_mentions: { parse: ["everyone"] },
+          })
+        );
+        await sendDiscord(form, form.getHeaders());
+        console.log(`📤 Sent media ${m.filename}`);
+      }
+      pendingMedia = [];
+
+      // parse & send structured fields
+      // Tags
+      const tags = tagsBlock
+        .split(/\r?\n/)
+        .map((l) => l.replace(/^-+\s*/, "").trim())
+        .filter(Boolean);
+      for (const t of tags)
         await sendDiscord({
-          content: freeform,
+          content: t,
           allowed_mentions: { parse: ["everyone"] },
         });
-      }
-    }
 
-    // b) Tags
-    const tags = (text.match(/Tags\s*:\s*\[([\s\S]*?)\]/i)?.[1] || "")
-      .split(/\r?\n/)
-      .map((l) => l.replace(/^-+\s*/, "").trim())
-      .filter(Boolean);
-    for (const t of tags)
-      await sendDiscord({
-        content: t,
-        allowed_mentions: { parse: ["everyone"] },
-      });
-
-    // c) Hashtags
-    const hsBlock = text.match(/Hastags\s*:\s*\[([\s\S]*?)\]/i)?.[1] || "";
-    const hashtags = hsBlock
-      .split(/\r?\n/)
-      .map((l) => l.trim())
-      .filter(Boolean)
-      .join("\n");
-    if (hashtags)
-      await sendDiscord({
-        content: hashtags,
-        allowed_mentions: { parse: ["everyone"] },
-      });
-
-    // d) Links
-    const links = (text.match(/Link\s*:\s*\[([\s\S]*?)\]/i)?.[1] || "")
-      .split(/\r?\n/)
-      .map((l) => l.trim())
-      .filter(Boolean);
-    for (const u of links)
-      await sendDiscord({
-        content: u,
-        allowed_mentions: { parse: ["everyone"] },
-      });
-
-    // e) Caption
-    let capText = "";
-    const capB = text.match(/Caption\s*:\s*\[([\s\S]*?)\]/i);
-    if (capB) capText = capB[1];
-    else {
-      const capD = text.match(/Caption\s*:\s*(?:\r?\n)?([\s\S]*)$/i);
-      if (capD) capText = capD[1];
-    }
-    if (capText) {
-      const caps = capText
+      // Hashtags (newline)
+      const hs = hashtagsBlock
         .split(/\r?\n/)
         .map((l) => l.trim())
         .filter(Boolean)
         .join("\n");
-      await sendDiscord({
-        content: caps,
-        allowed_mentions: { parse: ["everyone"] },
-      });
+      if (hs)
+        await sendDiscord({
+          content: hs,
+          allowed_mentions: { parse: ["everyone"] },
+        });
+
+      // Links
+      const links = linksBlock
+        .split(/\r?\n/)
+        .map((l) => l.trim())
+        .filter(Boolean);
+      for (const u of links)
+        await sendDiscord({
+          content: u,
+          allowed_mentions: { parse: ["everyone"] },
+        });
+
+      // Caption
+      const caps = captionBlock
+        .split(/\r?\n/)
+        .map((l) => l.trim())
+        .filter(Boolean)
+        .join("\n");
+      if (caps)
+        await sendDiscord({
+          content: caps,
+          allowed_mentions: { parse: ["everyone"] },
+        });
+    } else {
+      // unstructured text: clear any queued media (no reply)
+      if (pendingMedia.length) {
+        console.log("🗑 Clearing queued media (no structured reply)");
+        pendingMedia = [];
+      }
     }
   }
 }
 
+// start server
 const PORT = process.env.PORT || 3000;
 app.listen(PORT, () => console.log(`🚀 Listening on port ${PORT}`));
