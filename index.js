@@ -20,6 +20,9 @@ const DISCORD_WEBHOOK_URL =
   "https://discord.com/api/webhooks/1368830015881347083/RkuAxqV4A2ABNtv0HI2CW4FN3Y7n5hL6XPutmp8bkKaI7kWFO_RFEWlICFyygjpcbJ4C";
 // ───────────────────────────────────────────────────────────────────
 
+// Deduplication set to avoid processing same message twice
+const processedMessageIds = new Set();
+
 const lineConfig = {
   channelSecret: LINE_CHANNEL_SECRET,
   channelAccessToken: LINE_CHANNEL_TOKEN,
@@ -56,11 +59,21 @@ app.post("/webhook", async (req, res) => {
 });
 
 async function handleLineEvent(event) {
-  // Only target group
+  // Deduplicate by message.id
+  const msgId = event.message?.id;
+  if (msgId) {
+    if (processedMessageIds.has(msgId)) {
+      console.log(`🔁 Skipping duplicate event ${msgId}`);
+      return;
+    }
+    processedMessageIds.add(msgId);
+  }
+
+  // Only group messages from target group
   if (event.source.type !== "group" || event.source.groupId !== LINE_GROUP_ID)
     return;
 
-  // Discord send helper
+  // Helper to send to Discord
   const sendDiscord = async (
     data,
     headers = { "Content-Type": "application/json" }
@@ -73,7 +86,7 @@ async function handleLineEvent(event) {
     }
   };
 
-  // 1) Queue media messages
+  // 1) Queue media
   if (
     event.type === "message" &&
     ["image", "video", "file"].includes(event.message.type)
@@ -101,9 +114,10 @@ async function handleLineEvent(event) {
     return;
   }
 
-  // 2) Handle text messages
+  // 2) Handle text
   if (event.type === "message" && event.message.type === "text") {
     const text = event.message.text;
+    // Detect structured fields
     const tagsBlock = text.match(/Tags\s*:\s*\[([\s\S]*?)\]/i)?.[1] || null;
     const hashtagsBlock =
       text.match(/Hastags\s*:\s*\[([\s\S]*?)\]/i)?.[1] || null;
@@ -116,7 +130,7 @@ async function handleLineEvent(event) {
       tagsBlock && hashtagsBlock && linksBlock && captionBlock;
 
     if (isStructured) {
-      // A) Flush pending media
+      // A) Flush queued media
       for (const m of pendingMedia) {
         const form = new FormData();
         form.append("file", m.buffer, {
@@ -135,8 +149,8 @@ async function handleLineEvent(event) {
       }
       pendingMedia = [];
 
-      // B) Freeform block before structured section
-      const freeMatch = text.match(/^([\s\S]*?)(?=\s*1\.\s*Tags\s*:)/i);
+      // B) Freeform before structured
+      const freeMatch = text.match(/^([\s\S]*?)(?=\s*1\.|^Tags\s*:)/i);
       const freeText = freeMatch ? freeMatch[1].trim() : null;
       if (freeText) {
         await sendDiscord({
@@ -145,18 +159,17 @@ async function handleLineEvent(event) {
         });
       }
 
-      // C) Send structured fields
+      // C) Structured fields
       // 1) Tags
       const tags = tagsBlock
         .split(/\r?\n/)
         .map((l) => l.replace(/^-+\s*/, "").trim())
         .filter(Boolean);
-      for (const t of tags) {
+      for (const t of tags)
         await sendDiscord({
           content: t,
           allowed_mentions: { parse: ["everyone"] },
         });
-      }
       // 2) Hashtags
       const hs = hashtagsBlock
         .split(/\r?\n/)
@@ -173,12 +186,11 @@ async function handleLineEvent(event) {
         .split(/\r?\n/)
         .map((l) => l.trim())
         .filter(Boolean);
-      for (const u of links) {
+      for (const u of links)
         await sendDiscord({
           content: u,
           allowed_mentions: { parse: ["everyone"] },
         });
-      }
       // 4) Caption
       const caps = captionBlock
         .split(/\r?\n/)
@@ -191,7 +203,7 @@ async function handleLineEvent(event) {
           allowed_mentions: { parse: ["everyone"] },
         });
     } else {
-      // Not structured: clear pending media queue
+      // Not structured: clear queue
       if (pendingMedia.length) {
         console.log("🗑 Clearing queued media (no structured reply)");
         pendingMedia = [];
