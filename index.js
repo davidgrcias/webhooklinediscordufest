@@ -7,7 +7,7 @@ const line = require("@line/bot-sdk");
 const axios = require("axios");
 const FormData = require("form-data");
 
-// ─── CONFIGURATION ────────────────────────────────────────────────
+// ─── CONFIGURATION ──────────────────────────────────────
 const LINE_CHANNEL_SECRET =
   process.env.LINE_CHANNEL_SECRET || "e427cfcf924c9f724ebf4aae8995dd95";
 const LINE_CHANNEL_TOKEN =
@@ -18,11 +18,9 @@ const LINE_GROUP_ID =
 const DISCORD_WEBHOOK_URL =
   process.env.DISCORD_WEBHOOK_URL ||
   "https://discord.com/api/webhooks/1368830015881347083/RkuAxqV4A2ABNtv0HI2CW4FN3Y7n5hL6XPutmp8bkKaI7kWFO_RFEWlICFyygjpcbJ4C";
-// ───────────────────────────────────────────────────────────────────
+// ─────────────────────────────────────────────────
 
-// Deduplication set to avoid processing same message twice
 const processedMessageIds = new Set();
-
 const lineConfig = {
   channelSecret: LINE_CHANNEL_SECRET,
   channelAccessToken: LINE_CHANNEL_TOKEN,
@@ -30,7 +28,6 @@ const lineConfig = {
 const lineClient = new line.Client(lineConfig);
 const app = express();
 
-// Parse JSON & preserve raw body for signature
 app.use(
   bodyParser.json({
     verify: (req, res, buf) => {
@@ -40,10 +37,8 @@ app.use(
 );
 app.use(line.middleware(lineConfig));
 
-// Pending media queue
 let pendingMedia = [];
 
-// Webhook endpoint
 app.post("/webhook", async (req, res) => {
   const events = req.body.events || [];
   console.log(`📬 Received ${events.length} events`);
@@ -59,7 +54,6 @@ app.post("/webhook", async (req, res) => {
 });
 
 async function handleLineEvent(event) {
-  // Deduplicate by message.id
   const msgId = event.message?.id;
   if (msgId) {
     if (processedMessageIds.has(msgId)) {
@@ -69,11 +63,9 @@ async function handleLineEvent(event) {
     processedMessageIds.add(msgId);
   }
 
-  // Only group messages from target group
   if (event.source.type !== "group" || event.source.groupId !== LINE_GROUP_ID)
     return;
 
-  // Helper to send to Discord
   const sendDiscord = async (
     data,
     headers = { "Content-Type": "application/json" }
@@ -86,7 +78,6 @@ async function handleLineEvent(event) {
     }
   };
 
-  // 1) Queue media
   if (
     event.type === "message" &&
     ["image", "video", "file"].includes(event.message.type)
@@ -110,14 +101,15 @@ async function handleLineEvent(event) {
       contentType = "image/jpeg";
     }
     pendingMedia.push({ buffer, filename, contentType });
-    console.log(`📥 Queued media ${filename}`);
+    console.log(`📅 Queued media ${filename}`);
     return;
   }
 
-  // 2) Handle text
   if (event.type === "message" && event.message.type === "text") {
     const text = event.message.text;
-    // Detect structured fields
+
+    const isTriggerFormat = text.includes("FORMAT SISTEM");
+
     const tagsBlock = text.match(/Tags\s*:\s*\[([\s\S]*?)\]/i)?.[1] || null;
     const hashtagsBlock =
       text.match(/Hastags\s*:\s*\[([\s\S]*?)\]/i)?.[1] || null;
@@ -126,11 +118,18 @@ async function handleLineEvent(event) {
       text.match(/Caption\s*:\s*\[([\s\S]*?)\]/i)?.[1] ||
       text.match(/Caption\s*:\s*(?:\r?\n)?([\s\S]*)$/i)?.[1] ||
       null;
+
     const isStructured =
       tagsBlock && hashtagsBlock && linksBlock && captionBlock;
 
-    if (isStructured) {
-      // A) Flush queued media
+    if (isStructured && isTriggerFormat) {
+      const topMessage = text.split("FORMAT SISTEM")[0].trim();
+      if (topMessage)
+        await sendDiscord({
+          content: `**INFO:**\n${topMessage}`,
+          allowed_mentions: { parse: ["everyone"] },
+        });
+
       for (const m of pendingMedia) {
         const form = new FormData();
         form.append("file", m.buffer, {
@@ -149,18 +148,6 @@ async function handleLineEvent(event) {
       }
       pendingMedia = [];
 
-      // B) Freeform before structured
-      const freeMatch = text.match(/^([\s\S]*?)(?=\s*1\.|^Tags\s*:)/i);
-      const freeText = freeMatch ? freeMatch[1].trim() : null;
-      if (freeText) {
-        await sendDiscord({
-          content: freeText,
-          allowed_mentions: { parse: ["everyone"] },
-        });
-      }
-
-      // C) Structured fields
-      // 1) Tags
       const tags = tagsBlock
         .split(/\r?\n/)
         .map((l) => l.replace(/^-+\s*/, "").trim())
@@ -170,7 +157,7 @@ async function handleLineEvent(event) {
           content: t,
           allowed_mentions: { parse: ["everyone"] },
         });
-      // 2) Hashtags
+
       const hs = hashtagsBlock
         .split(/\r?\n/)
         .map((l) => l.trim())
@@ -181,7 +168,7 @@ async function handleLineEvent(event) {
           content: hs,
           allowed_mentions: { parse: ["everyone"] },
         });
-      // 3) Links
+
       const links = linksBlock
         .split(/\r?\n/)
         .map((l) => l.trim())
@@ -191,7 +178,7 @@ async function handleLineEvent(event) {
           content: u,
           allowed_mentions: { parse: ["everyone"] },
         });
-      // 4) Caption
+
       const caps = captionBlock
         .split(/\r?\n/)
         .map((l) => l.trim())
@@ -203,7 +190,6 @@ async function handleLineEvent(event) {
           allowed_mentions: { parse: ["everyone"] },
         });
     } else {
-      // Not structured: clear queue
       if (pendingMedia.length) {
         console.log("🗑 Clearing queued media (no structured reply)");
         pendingMedia = [];
@@ -212,6 +198,5 @@ async function handleLineEvent(event) {
   }
 }
 
-// Start server
 const PORT = process.env.PORT || 3000;
 app.listen(PORT, () => console.log(`🚀 Listening on port ${PORT}`));
