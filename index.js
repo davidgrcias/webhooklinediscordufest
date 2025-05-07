@@ -17,7 +17,7 @@ const LINE_GROUP_ID =
   process.env.LINE_GROUP_ID || "C844da05c08cb0edb188e321d15e46a9b";
 const DISCORD_WEBHOOK_URL =
   process.env.DISCORD_WEBHOOK_URL ||
-  "https://discord.com/api/webhooks/1368830015881347083/RkuAxqV4A2ABNtv0HI2CW4FN3Y7n5hL6XPutmp8bkKaI7kWFO_RFEWlICFyygjpcbJ4C";
+  "https://discord.com/api/webhooks/1369581355759042647/5H--gO5lIe-QL4JRB9LxjvUEbw8cG3zhhv0PhqvamktdEh3GnOtisiet8F5leH63N5hw";
 // ─────────────────────────────────────────────────
 
 const processedMessageIds = new Set();
